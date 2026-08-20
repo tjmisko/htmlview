@@ -1,60 +1,79 @@
 # htmlview
 
-Bare WebKitGTK window for viewing local HTML/JS artifacts (e.g. Claude Code
-artifacts) without a browser: no tabs, no URL bar, no browser profile. One
-Python file on top of libraries Fedora already ships.
+A bare WebKitGTK window for viewing local HTML/JS files without a browser.
+
+No tabs, no URL bar, no browser profile, no extensions: one Python file on top
+of libraries your distribution already ships. Built for rendering generated
+HTML artifacts (e.g. from Claude Code) that use `fetch()` and ES modules,
+which browsers refuse to run from `file://`.
 
 ```
 htmlview page.html            # local file
-htmlview -w page.html         # reload on save
+htmlview -w page.html         # reload whenever the file changes
+htmlview --light page.html    # force a color scheme (--dark / --light)
 htmlview https://example.com  # any URL
-cat page.html | htmlview -    # stdin
+cat page.html | htmlview -    # read HTML from stdin
 ```
+
+Starts in about a quarter of a second.
 
 ## Install
 
+Requirements: Python 3, PyGObject, GTK 4, WebKitGTK 6.0.
+
 ```
+# Fedora
 sudo dnf install python3-gobject gtk4 webkitgtk6.0
-ln -sfn ~/Tools/htmlview/htmlview ~/.local/bin/htmlview
+# Debian / Ubuntu
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-webkit-6.0
+# Arch
+sudo pacman -S python-gobject gtk4 webkitgtk-6.0
+```
+
+Then put the script on your `PATH`:
+
+```
+git clone https://github.com/tjmisko/htmlview.git
+ln -s "$PWD/htmlview/htmlview" ~/.local/bin/htmlview
 ```
 
 ## Keys
 
-| Key                  | Action                              |
-| -------------------- | ----------------------------------- |
-| `q` `Ctrl-W` `Ctrl-Q`| quit                                |
-| `r` `F5`             | reload (`Ctrl-R` bypasses cache)    |
-| `+` `-` `0`          | zoom in / out / reset (also `Ctrl-`)|
-| `[` `]`              | back / forward                      |
-| `F12` `Ctrl-Shift-I` | web inspector                       |
+| Key                   | Action                                |
+| --------------------- | ------------------------------------- |
+| `q` `Ctrl-W` `Ctrl-Q` | quit                                  |
+| `r` `F5`              | reload (`Ctrl-R` bypasses the cache)  |
+| `+` `-` `0`           | zoom in / out / reset (also with `Ctrl`) |
+| `[` `]`               | back / forward                        |
+| `F12` `Ctrl-Shift-I`  | web inspector                         |
 
 Single-letter keys are suppressed while an `<input>`, `<textarea>`, or
-contenteditable has focus, so typing `q` in a form field does not close the
-window. Modifier bindings always work.
+contenteditable element has focus, so typing `q` into a form field does not
+close the window. Modifier bindings always work.
 
 ## Behaviour
 
-- `fetch()` and ES module imports work from `file://`. Real browsers block
-  these, which is the usual reason an artifact renders blank when opened
-  directly.
-- `prefers-color-scheme` follows `org.gnome.desktop.interface color-scheme`
-  (or a `*-dark` `gtk-theme`, as GTK itself does); override with `--dark` /
-  `--light` (implemented by setting `GTK_THEME`,
-  which is what stops GTK re-syncing the scheme from the system). In dark
-  mode the view background is set dark before first paint, so there is no
-  white flash.
-- When viewing a local file, clicking an `http(s)` link opens it in the default
-  browser (`xdg-open`); local navigation stays in-view. Popups always go
-  external. When given a URL, htmlview behaves like a plain browser.
-- Page console output (`console.log`, uncaught errors) is echoed to stderr
-  (WebKit's `enable-write-console-messages-to-stdout`, despite the name). The
-  web process buffers it when stderr is a pipe, so it lands on exit.
-- Each invocation is its own process and window (`NON_UNIQUE`), so several
-  files can be open at once and the Wayland `app_id` is `htmlview` for window
-  rules.
-- Site data (`localStorage`, cache) lives under `~/.local/share/htmlview/`
-  and `~/.cache/htmlview/`, so an artifact's remembered state survives
-  between runs. Delete those directories to reset.
+- **`file://` is unrestricted.** `fetch()`, `XMLHttpRequest`, and ES module
+  imports work against sibling files. Real browsers block these, which is the
+  usual reason a generated page renders blank when opened directly.
+- **Color scheme** follows the system (`org.gnome.desktop.interface
+  color-scheme`, or a `*-dark` `gtk-theme`, as GTK itself does). Override with
+  `--dark` / `--light`. In dark mode the view background is painted dark before
+  first load, so there is no white flash.
+- **Links.** When viewing a local file, clicking an `http(s)` link opens it in
+  your default browser; navigation between local files stays in the window.
+  Popups (`target=_blank`, `window.open`) always go to the browser. When given
+  a URL, htmlview behaves like a plain browser.
+- **Console output.** `console.log` and uncaught errors are echoed to stderr.
+  The web process buffers this when stderr is a pipe, so redirected output
+  arrives on exit.
+- **One window per invocation.** Running `htmlview` twice gives you two
+  independent windows. The Wayland `app_id` / X11 class is `htmlview`, for
+  compositor window rules.
+- **Site data** (`localStorage`, cache) is kept under
+  `~/.local/share/htmlview/` and `~/.cache/htmlview/`, so a page's remembered
+  state survives between runs. Delete those directories to reset.
+- **Ctrl-C** in the terminal quits cleanly.
 
 ## Tests
 
@@ -62,15 +81,35 @@ window. Modifier bindings always work.
 python3 test_htmlview.py
 ```
 
-Each test opens a real window for a few seconds, sends SIGINT, and reads the
-console output the fixture (`examples/hello.html`) emits. Needs a running
-Wayland/X session.
+Each test launches a real window for a few seconds, interrupts it, and checks
+the console output emitted by `examples/hello.html`. A running Wayland or X
+session is required; no extra test dependencies.
 
-## Notes
+## Troubleshooting
 
-Portal warnings on stderr (`Cannot get portal org.freedesktop.portal.Settings`)
-mean `xdg-desktop-portal` is not running. That is a session problem, not an
-htmlview one: the portal has `Requisite=graphical-session.target`, and a
-compositor launched bare from a TTY never starts that target. See
-`~/.config/systemd/user/hyprland-session.target` and the `hyprland.start`
-hook in `~/.config/hypr/hyprland.lua` for the fix used here.
+**`Cannot get portal org.freedesktop.portal.Settings ... startup job failed`
+on stderr.** GTK could not reach `xdg-desktop-portal`, so it falls back to
+GSettings; the page still renders. On a compositor started bare from a TTY the
+cause is usually that nothing activated `graphical-session.target` in your
+user session, and the portal service refuses to start without it
+(`Requisite=graphical-session.target`). Start your compositor through
+`uwsm`, or have it start a target that binds to `graphical-session.target`
+after exporting `WAYLAND_DISPLAY` with `dbus-update-activation-environment
+--systemd`.
+
+**Page is light although the system is dark (or vice versa).** Pass
+`--dark` / `--light`. Auto mode reads GSettings, which may differ from what a
+non-GNOME desktop configures elsewhere.
+
+**Rendering glitches on unusual GPUs.** Try `WEBKIT_DISABLE_DMABUF_RENDERER=1
+htmlview page.html`, and if that helps, `WEBKIT_DISABLE_COMPOSITING_MODE=1`.
+
+## How it works
+
+`htmlview` is a single `Gtk.Application` holding one `WebKit.WebView`. A
+`Gtk.EventControllerKey` in the capture phase handles the key bindings before
+the view sees them; a small user script posts focus changes back over
+`webkit.messageHandlers` so bindings can step aside while you type. `-w` uses
+a `Gio.FileMonitor` with a short debounce. `--dark`/`--light` set `GTK_THEME`
+before GTK initialises, which is what stops GTK re-syncing the color scheme
+from the system.
