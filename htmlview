@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""htmlview: minimal WebKitGTK viewer for local HTML/JS artifacts.
+
+usage: htmlview [-w] [--dark | --light] <file.html | url | ->
+
+Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
+       + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
+Page console output (console.log, uncaught errors) is echoed to stderr; when
+stderr is a pipe the web process buffers it until exit.
+"""
+import argparse
+import os
+import signal
+import sys
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(
+        prog="htmlview",
+        description="Render a local HTML/JS file (or URL) in a bare WebKitGTK window.",
+    )
+    ap.add_argument("target", help="HTML file, URL, or - for stdin")
+    ap.add_argument("-w", "--watch", action="store_true",
+                    help="reload when the file changes")
+    theme = ap.add_mutually_exclusive_group()
+    theme.add_argument("--dark", action="store_true",
+                       help="force prefers-color-scheme: dark")
+    theme.add_argument("--light", action="store_true",
+                       help="force prefers-color-scheme: light")
+    return ap.parse_args(argv)
+
+
+ARGS = parse_args(sys.argv[1:])
+
+# WebKit derives prefers-color-scheme from GtkSettings' prefer-dark property,
+# and GTK keeps re-syncing that property from the system color scheme, which
+# clobbers any explicit value. Setting GTK_THEME disables that sync, so it is
+# the lever for --dark/--light. It must be in place before GTK initialises,
+# i.e. before the imports below.
+if ARGS.dark or ARGS.light:
+    os.environ["GTK_THEME"] = "Adwaita:dark" if ARGS.dark else "Adwaita:light"
+
+import gi  # noqa: E402
+
+try:
+    gi.require_version("Gdk", "4.0")
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("WebKit", "6.0")
+except ValueError as err:
+    sys.exit(f"htmlview: {err}\n  sudo dnf install python3-gobject gtk4 webkitgtk6.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, WebKit  # noqa: E402
+
+try:  # PyGObject >= 3.50 moved the unix signal API to its own namespace
+    gi.require_version("GLibUnix", "2.0")
+    from gi.repository import GLibUnix
+    unix_signal_add = GLibUnix.signal_add
+except (ValueError, ImportError):
+    unix_signal_add = GLib.unix_signal_add
+
+ZOOM_STEP = 1.1
+DARK_BG = "#1e1e1e"
+WATCH_DEBOUNCE_MS = 150
+
+# Injected at document end; tells the shell whether focus is in an editable
+# element, so single-letter bindings don't eat your typing.
+FOCUS_PROBE = """
+(() => {
+  const editable = (el) => !!el && (
+    el.isContentEditable ||
+    ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName)
+  );
+  const post = () => window.webkit.messageHandlers.editable
+    .postMessage(editable(document.activeElement));
+  document.addEventListener('focusin', post, true);
+  document.addEventListener('focusout', () => setTimeout(post, 0), true);
+  post();
+})();
+"""
+
+
+def system_prefers_dark():
+    """Mirror GTK's own reading of the system: color-scheme, or a -dark theme."""
+    source = Gio.SettingsSchemaSource.get_default()
+    if source is None or source.lookup("org.gnome.desktop.interface", True) is None:
+        return False
+    settings = Gio.Settings.new("org.gnome.desktop.interface")
+    return (
+        settings.get_string("color-scheme") == "prefer-dark"
+        or settings.get_string("gtk-theme").endswith("-dark")
+    )
+
+
+class Viewer:
+    def __init__(self, app, args):
+        self.app = app
+        self.args = args
+        self.editable_focus = False
+        self.reload_pending = 0
+        self.local_file = None
+
+        dark = args.dark or (not args.light and system_prefers_dark())
+        Gtk.Settings.get_default().set_property(
+            "gtk-application-prefer-dark-theme", dark
+        )
+
+        ucm = WebKit.UserContentManager()
+        ucm.register_script_message_handler("editable", None)
+        ucm.connect("script-message-received::editable", self.on_editable)
+        ucm.add_script(WebKit.UserScript.new(
+            FOCUS_PROBE,
+            WebKit.UserContentInjectedFrames.TOP_FRAME,
+            WebKit.UserScriptInjectionTime.END,
+            None, None,
+        ))
+
+        # Default network session: data lives under ~/.local/share/htmlview and
+        # ~/.cache/htmlview, so localStorage persists across runs. (An ephemeral
+        # session would be tidier, but its web process exits without flushing
+        # the console echo enabled below.)
+        self.view = WebKit.WebView(user_content_manager=ucm)
+        settings = self.view.get_settings()
+        settings.set_enable_developer_extras(True)
+        settings.set_enable_write_console_messages_to_stdout(True)  # lands on stderr
+        # Browsers block fetch()/ES module imports from file://; artifacts need them.
+        settings.set_allow_file_access_from_file_urls(True)
+        settings.set_allow_universal_access_from_file_urls(True)
+
+        if dark:
+            bg = Gdk.RGBA()
+            bg.parse(DARK_BG)
+            self.view.set_background_color(bg)
+
+        self.view.connect("decide-policy", self.on_decide_policy)
+        self.view.connect("notify::title", self.on_title)
+
+        self.win = Gtk.ApplicationWindow(
+            application=app, default_width=1200, default_height=900,
+            title="htmlview",
+        )
+        self.win.set_child(self.view)
+
+        keys = Gtk.EventControllerKey()
+        # CAPTURE: see keys before the WebView swallows them.
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.win.add_controller(keys)
+
+        self.load(args.target)
+        self.win.present()
+
+    # -- loading ---------------------------------------------------------
+
+    def load(self, target):
+        if target == "-":
+            base = Gio.File.new_for_path(os.getcwd()).get_uri() + "/"
+            self.view.load_html(sys.stdin.read(), base)
+            return
+
+        gfile = Gio.File.new_for_commandline_arg(target)
+        if gfile.get_uri_scheme() == "file":
+            if not gfile.query_exists(None):
+                sys.exit(f"htmlview: no such file: {target}")
+            self.local_file = gfile
+            self.win.set_title(gfile.get_basename())
+            if self.args.watch:
+                self.monitor = gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
+                self.monitor.connect("changed", self.on_file_changed)
+        self.view.load_uri(gfile.get_uri())
+
+    def on_file_changed(self, _monitor, _file, _other, event):
+        if event not in (
+            Gio.FileMonitorEvent.CHANGED,
+            Gio.FileMonitorEvent.CHANGES_DONE_HINT,
+            Gio.FileMonitorEvent.CREATED,
+        ):
+            return
+        # Debounce: editors emit several events per save.
+        if self.reload_pending:
+            GLib.source_remove(self.reload_pending)
+        self.reload_pending = GLib.timeout_add(WATCH_DEBOUNCE_MS, self.reload_now)
+
+    def reload_now(self):
+        self.reload_pending = 0
+        self.view.reload()
+        return GLib.SOURCE_REMOVE
+
+    # -- signals ---------------------------------------------------------
+
+    def on_editable(self, _ucm, value):
+        self.editable_focus = bool(value.to_boolean())
+
+    def on_title(self, view, _param):
+        if view.get_title():
+            self.win.set_title(view.get_title())
+
+    def on_decide_policy(self, _view, decision, decision_type):
+        """Hand web links off to the real browser when viewing a local file.
+
+        Local navigation (multi-page artifacts, anchors) stays in-view, as does
+        everything when htmlview was given a URL. Popups always go external.
+        """
+        if decision_type == WebKit.PolicyDecisionType.NEW_WINDOW_ACTION:
+            external = True
+        elif decision_type == WebKit.PolicyDecisionType.NAVIGATION_ACTION:
+            action = decision.get_navigation_action()
+            external = (
+                self.local_file is not None
+                and action.get_navigation_type() == WebKit.NavigationType.LINK_CLICKED
+                and action.get_request().get_uri().startswith(("http://", "https://"))
+            )
+        else:
+            return False
+        if not external:
+            return False
+        decision.ignore()
+        uri = decision.get_navigation_action().get_request().get_uri()
+        context = Gdk.Display.get_default().get_app_launch_context()
+        context.unsetenv("GTK_THEME")  # ours, not the browser's
+        try:
+            Gio.AppInfo.launch_default_for_uri(uri, context)
+        except GLib.Error as err:
+            print(f"htmlview: could not open {uri}: {err.message}", file=sys.stderr)
+        return True
+
+    # -- keys ------------------------------------------------------------
+
+    def zoom(self, factor):
+        self.view.set_zoom_level(self.view.get_zoom_level() * factor)
+
+    def on_key(self, _ctrl, keyval, _keycode, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+
+        # Always-on, modifier-guarded bindings.
+        if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_w):
+            self.win.close()
+            return True
+        if ctrl and keyval == Gdk.KEY_r:
+            self.view.reload_bypass_cache()
+            return True
+        if ctrl and keyval in (Gdk.KEY_plus, Gdk.KEY_equal):
+            self.zoom(ZOOM_STEP)
+            return True
+        if ctrl and keyval == Gdk.KEY_minus:
+            self.zoom(1 / ZOOM_STEP)
+            return True
+        if ctrl and keyval == Gdk.KEY_0:
+            self.view.set_zoom_level(1.0)
+            return True
+        if keyval == Gdk.KEY_F5:
+            self.view.reload()
+            return True
+        if keyval == Gdk.KEY_F12 or (ctrl and shift and keyval == Gdk.KEY_I):
+            self.view.get_inspector().show()
+            return True
+
+        # Single-letter bindings, suppressed while typing in the page.
+        if self.editable_focus or ctrl:
+            return False
+        if keyval == Gdk.KEY_q:
+            self.win.close()
+        elif keyval == Gdk.KEY_r:
+            self.view.reload()
+        elif keyval in (Gdk.KEY_plus, Gdk.KEY_equal):
+            self.zoom(ZOOM_STEP)
+        elif keyval == Gdk.KEY_minus:
+            self.zoom(1 / ZOOM_STEP)
+        elif keyval == Gdk.KEY_0:
+            self.view.set_zoom_level(1.0)
+        elif keyval == Gdk.KEY_bracketleft:
+            self.view.go_back()
+        elif keyval == Gdk.KEY_bracketright:
+            self.view.go_forward()
+        else:
+            return False
+        return True
+
+
+def main():
+    GLib.set_prgname("htmlview")  # Wayland app_id for window rules
+    # NON_UNIQUE: every invocation is its own process and window; without it a
+    # second `htmlview b.html` would just raise the first window and exit.
+    app = Gtk.Application(flags=Gio.ApplicationFlags.NON_UNIQUE)
+    app.connect("activate", lambda a: Viewer(a, ARGS))
+    install_quit_signals(app)
+    return app.run([])
+
+
+def install_quit_signals(app):
+    """Quit on SIGINT/SIGTERM by closing windows, exactly like pressing q.
+
+    PyGObject's own Ctrl-C fallback calls app.quit() from a Python signal
+    handler and then raises KeyboardInterrupt; on that path WebKit kills the
+    web process before it flushes the console echo. Resetting Python's SIGINT
+    disposition first makes PyGObject skip its fallback, so the GLib source
+    below is what runs.
+    """
+    def close_all():
+        for win in app.get_windows():
+            win.close()
+        return GLib.SOURCE_REMOVE
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        unix_signal_add(GLib.PRIORITY_DEFAULT, signum, close_all)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
