@@ -5,6 +5,9 @@ usage: htmlview [-w] [--dark | --light] <file.html | url | ->
 
 Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
+       j k scroll   gg top   G bottom
+       / search (Enter keeps highlights, Esc clears)   n N next / previous
+       Esc clears highlights
 Page console output (console.log, uncaught errors) is echoed to stderr; when
 stderr is a pipe the web process buffers it until exit.
 """
@@ -12,6 +15,9 @@ import argparse
 import os
 import signal
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from keys import KeyDispatcher, smartcase_insensitive  # noqa: E402
 
 
 def parse_args(argv):
@@ -58,6 +64,8 @@ except (ValueError, ImportError):
     unix_signal_add = GLib.unix_signal_add
 
 ZOOM_STEP = 1.1
+SCROLL_STEP_PX = 60
+SEARCH_MAX_MATCHES = 10000
 DARK_BG = "#1e1e1e"
 WATCH_DEBOUNCE_MS = 150
 
@@ -137,7 +145,13 @@ class Viewer:
             application=app, default_width=1200, default_height=900,
             title="htmlview",
         )
-        self.win.set_child(self.view)
+        self.view.set_vexpand(True)
+        self.build_search_bar()
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(self.view)
+        box.append(self.search_bar)
+        self.win.set_child(box)
+        self.dispatcher = KeyDispatcher()
 
         keys = Gtk.EventControllerKey()
         # CAPTURE: see keys before the WebView swallows them.
@@ -227,53 +241,130 @@ class Viewer:
     def zoom(self, factor):
         self.view.set_zoom_level(self.view.get_zoom_level() * factor)
 
+    def scroll_by(self, dy):
+        self.view.evaluate_javascript(
+            f"window.scrollBy(0, {dy})", -1, None, None, None, None, None)
+
+    def scroll_to(self, bottom):
+        target = "document.scrollingElement.scrollHeight" if bottom else "0"
+        self.view.evaluate_javascript(
+            f"window.scrollTo(0, {target})", -1, None, None, None, None, None)
+
     def on_key(self, _ctrl, keyval, _keycode, state):
-        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
-        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
-
-        # Always-on, modifier-guarded bindings.
-        if ctrl and keyval in (Gdk.KEY_q, Gdk.KEY_w):
-            self.win.close()
-            return True
-        if ctrl and keyval == Gdk.KEY_r:
-            self.view.reload_bypass_cache()
-            return True
-        if ctrl and keyval in (Gdk.KEY_plus, Gdk.KEY_equal):
-            self.zoom(ZOOM_STEP)
-            return True
-        if ctrl and keyval == Gdk.KEY_minus:
-            self.zoom(1 / ZOOM_STEP)
-            return True
-        if ctrl and keyval == Gdk.KEY_0:
-            self.view.set_zoom_level(1.0)
-            return True
-        if keyval == Gdk.KEY_F5:
-            self.view.reload()
-            return True
-        if keyval == Gdk.KEY_F12 or (ctrl and shift and keyval == Gdk.KEY_I):
-            self.view.get_inspector().show()
-            return True
-
-        # Single-letter bindings, suppressed while typing in the page.
-        if self.editable_focus or ctrl:
+        action = self.dispatcher.dispatch(
+            Gdk.keyval_name(keyval),
+            ctrl=bool(state & Gdk.ModifierType.CONTROL_MASK),
+            shift=bool(state & Gdk.ModifierType.SHIFT_MASK),
+            now_ms=GLib.get_monotonic_time() // 1000,
+            editable_focus=self.editable_focus,
+            search_focused=self.search_entry.has_focus()
+            or self.search_entry.get_focus_child() is not None,
+        )
+        if action is None:
             return False
-        if keyval == Gdk.KEY_q:
-            self.win.close()
-        elif keyval == Gdk.KEY_r:
-            self.view.reload()
-        elif keyval in (Gdk.KEY_plus, Gdk.KEY_equal):
-            self.zoom(ZOOM_STEP)
-        elif keyval == Gdk.KEY_minus:
-            self.zoom(1 / ZOOM_STEP)
-        elif keyval == Gdk.KEY_0:
-            self.view.set_zoom_level(1.0)
-        elif keyval == Gdk.KEY_bracketleft:
-            self.view.go_back()
-        elif keyval == Gdk.KEY_bracketright:
-            self.view.go_forward()
-        else:
-            return False
+        self.perform(action)
         return True
+
+    def perform(self, action):
+        if action == "quit":
+            self.win.close()
+        elif action == "reload":
+            self.view.reload()
+        elif action == "reload_bypass_cache":
+            self.view.reload_bypass_cache()
+        elif action == "zoom_in":
+            self.zoom(ZOOM_STEP)
+        elif action == "zoom_out":
+            self.zoom(1 / ZOOM_STEP)
+        elif action == "zoom_reset":
+            self.view.set_zoom_level(1.0)
+        elif action == "back":
+            self.view.go_back()
+        elif action == "forward":
+            self.view.go_forward()
+        elif action == "inspector":
+            self.view.get_inspector().show()
+        elif action == "scroll_down":
+            self.scroll_by(SCROLL_STEP_PX)
+        elif action == "scroll_up":
+            self.scroll_by(-SCROLL_STEP_PX)
+        elif action == "top":
+            self.scroll_to(bottom=False)
+        elif action == "bottom":
+            self.scroll_to(bottom=True)
+        elif action == "search_open":
+            self.search_open()
+        elif action == "search_next":
+            if self.last_query:
+                self.find.search_next()
+        elif action == "search_prev":
+            if self.last_query:
+                self.find.search_previous()
+        elif action == "search_close":
+            self.search_close(clear=True)
+        elif action == "clear_search":
+            self.find.search_finish()
+            self.last_query = ""
+        # "g_pending" needs no side effect.
+
+    # -- search ----------------------------------------------------------
+
+    def build_search_bar(self):
+        bar = Gtk.Box(spacing=6, margin_start=6, margin_end=6,
+                      margin_top=3, margin_bottom=3)
+        bar.append(Gtk.Label(label="/"))
+        self.search_entry = Gtk.Entry(hexpand=True, has_frame=False)
+        self.search_entry.connect("changed", self.on_search_changed)
+        self.search_entry.connect("activate", self.on_search_activate)
+        bar.append(self.search_entry)
+        self.search_status = Gtk.Label(label="", xalign=1)
+        self.search_status.add_css_class("dim-label")
+        bar.append(self.search_status)
+        bar.set_visible(False)
+        self.search_bar = bar
+        self.find = self.view.get_find_controller()
+        self.find.connect("counted-matches", self.on_counted_matches)
+        self.find.connect("failed-to-find-text", lambda _f: self.set_status(0))
+        self.last_query = ""
+
+    def set_status(self, count):
+        if not self.search_entry.get_text():
+            self.search_status.set_text("")
+        elif count:
+            self.search_status.set_text(f"{count} match" + ("" if count == 1 else "es"))
+        else:
+            self.search_status.set_text("no match")
+
+    def search_open(self):
+        self.search_bar.set_visible(True)
+        self.search_entry.grab_focus()
+        self.search_entry.select_region(0, -1)
+
+    def search_close(self, clear):
+        self.search_bar.set_visible(False)
+        self.view.grab_focus()
+        if clear:
+            self.find.search_finish()
+            self.last_query = ""
+
+    def on_search_changed(self, entry):
+        query = entry.get_text()
+        self.last_query = query
+        if not query:
+            self.find.search_finish()
+            self.set_status(0)
+            return
+        opts = WebKit.FindOptions.WRAP_AROUND
+        if smartcase_insensitive(query):
+            opts |= WebKit.FindOptions.CASE_INSENSITIVE
+        self.find.search(query, opts, SEARCH_MAX_MATCHES)
+        self.find.count_matches(query, opts, SEARCH_MAX_MATCHES)
+
+    def on_counted_matches(self, _find, count):
+        self.set_status(count)
+
+    def on_search_activate(self, _entry):
+        self.search_close(clear=False)
 
 
 def main():
