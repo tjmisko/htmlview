@@ -39,11 +39,11 @@ def parse_args(argv):
 
 ARGS = parse_args(sys.argv[1:])
 
-# WebKit derives prefers-color-scheme from GtkSettings' prefer-dark property,
-# and GTK keeps re-syncing that property from the system color scheme, which
-# clobbers any explicit value. Setting GTK_THEME disables that sync, so it is
-# the lever for --dark/--light. It must be in place before GTK initialises,
-# i.e. before the imports below.
+# Older WebKit derives prefers-color-scheme from GtkSettings' prefer-dark
+# property, and GTK keeps re-syncing that property from the system color
+# scheme, which clobbers any explicit value. Setting GTK_THEME disables that
+# sync. It must be in place before GTK initialises, i.e. before the imports
+# below. Newer GTK/WebKit use gtk-interface-color-scheme instead; Viewer sets it.
 if ARGS.dark or ARGS.light:
     os.environ["GTK_THEME"] = "Adwaita:dark" if ARGS.dark else "Adwaita:light"
 
@@ -133,9 +133,16 @@ class Viewer:
         self.local_file = None
 
         dark = args.dark or (not args.light and system_prefers_dark())
-        Gtk.Settings.get_default().set_property(
-            "gtk-application-prefer-dark-theme", dark
-        )
+        gtk_settings = Gtk.Settings.get_default()
+        gtk_settings.set_property("gtk-application-prefer-dark-theme", dark)
+        # GTK >= 4.20 also carries the scheme in gtk-interface-color-scheme,
+        # which newer WebKit reads for prefers-color-scheme; GTK_THEME does not
+        # override it, so force it too.
+        if (args.dark or args.light) and hasattr(Gtk, "InterfaceColorScheme"):
+            gtk_settings.set_property(
+                "gtk-interface-color-scheme",
+                Gtk.InterfaceColorScheme.DARK if dark else Gtk.InterfaceColorScheme.LIGHT,
+            )
 
         ucm = WebKit.UserContentManager()
         ucm.register_script_message_handler("editable", None)
