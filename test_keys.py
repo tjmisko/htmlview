@@ -17,6 +17,14 @@ class KeyDispatcherTests(unittest.TestCase):
         self.assertEqual(press(self.d, "j"), "scroll_down")
         self.assertEqual(press(self.d, "k"), "scroll_up")
 
+    def test_should_scroll_half_page_when_page_keys_pressed(self):
+        self.assertEqual(press(self.d, "Page_Down"), "half_page_down")
+        self.assertEqual(press(self.d, "Page_Up"), "half_page_up")
+
+    def test_should_leave_page_keys_alone_when_typing(self):
+        self.assertIsNone(press(self.d, "Page_Down", editable=True))
+        self.assertIsNone(press(self.d, "Page_Up", search=True))
+
     def test_should_go_to_bottom_when_G_pressed(self):
         self.assertEqual(press(self.d, "G", shift=True), "bottom")
 

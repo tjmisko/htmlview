@@ -31,6 +31,8 @@ PLAIN_ACTIONS = {
     "j": "scroll_down",
     "k": "scroll_up",
     "G": "bottom",
+    "Page_Down": "half_page_down",
+    "Page_Up": "half_page_up",
     "slash": "search_open",
     "n": "search_next",
     "N": "search_prev",

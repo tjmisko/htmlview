@@ -5,7 +5,7 @@ usage: htmlview [-w] [--dark | --light] <file.html | url | ->
 
 Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
-       j k scroll   gg top   G bottom
+       j k scroll   PgUp PgDn half page   gg top   G bottom
        / search (Enter keeps highlights, Esc clears)   n N next / previous
        Esc clears highlights
 Page console output (console.log, uncaught errors) is echoed to stderr; when
@@ -288,6 +288,10 @@ class Viewer:
             self.scroll_by(SCROLL_STEP_PX)
         elif action == "scroll_up":
             self.scroll_by(-SCROLL_STEP_PX)
+        elif action == "half_page_down":
+            self.scroll_by("window.innerHeight / 2")
+        elif action == "half_page_up":
+            self.scroll_by("-window.innerHeight / 2")
         elif action == "top":
             self.scroll_to(bottom=False)
         elif action == "bottom":
