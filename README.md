@@ -90,7 +90,10 @@ close the window. Modifier bindings always work.
   own (the color scheme is process-wide), and `--separate` opens a fully
   independent process, whose page console output stays on its own stderr.
   One page crashing the web process takes the windows sharing it down too.
-  The Wayland `app_id` / X11 class is `htmlview`, for compositor window rules.- **Site data** (`localStorage`, cache) is kept under
+  The Wayland `app_id` / X11 class is `htmlview`, for compositor window rules.
+- **No JavaScript JIT.** JavaScriptCore runs interpreted, saving about 10 MiB
+  per web process; generated documents don't notice. Set `HTMLVIEW_JIT=1` for
+  JavaScript-heavy pages.- **Site data** (`localStorage`, cache) is kept under
   `~/.local/share/htmlview/` and `~/.cache/htmlview/`, so a page's remembered
   state survives between runs. Delete those directories to reset.
 - **Ctrl-C** in the terminal quits cleanly.

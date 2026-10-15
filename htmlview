@@ -6,7 +6,8 @@ usage: htmlview [-w] [--dark | --light] [--separate] <file.html | url | ->
 Windows share one process and one web engine: the first htmlview becomes the
 host, and later invocations hand their target to it and exit, so each extra
 window costs a few MiB instead of a whole engine. --separate (implied by -)
-opens an independent process instead.
+opens an independent process instead. The JavaScript JIT is off to save memory;
+HTMLVIEW_JIT=1 turns it back on.
 
 Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
@@ -61,6 +62,11 @@ if not SEPARATE:
     if _reply is not None:
         sys.exit(f"htmlview: {_reply.removeprefix('error: ')}")
     ARGS.target = _target
+
+# JavaScriptCore's JIT costs ~10 MiB per web process; the pages htmlview is for
+# don't need it. The web process inherits this environment.
+if os.environ.get("HTMLVIEW_JIT") != "1":
+    os.environ.setdefault("JSC_useJIT", "0")
 
 # Older WebKit derives prefers-color-scheme from GtkSettings' prefer-dark
 # property, and GTK keeps re-syncing that property from the system color
@@ -308,6 +314,8 @@ class Viewer:
         uri = decision.get_navigation_action().get_request().get_uri()
         context = Gdk.Display.get_default().get_app_launch_context()
         context.unsetenv("GTK_THEME")  # ours, not the browser's
+        if os.environ.get("HTMLVIEW_JIT") != "1":
+            context.unsetenv("JSC_useJIT")
         try:
             Gio.AppInfo.launch_default_for_uri(uri, context)
         except GLib.Error as err:
