@@ -2,7 +2,7 @@
 
 A bare WebKitGTK window for viewing local HTML/JS files without a browser.
 
-No tabs, no URL bar, no browser profile, no extensions: one Python file on top
+No tabs, no URL bar, no browser profile, no extensions: one Python script (plus a small key-map module) on top
 of libraries your distribution already ships. Built for rendering generated
 HTML artifacts (e.g. from Claude Code) that use `fetch()` and ES modules,
 which browsers refuse to run from `file://`.
@@ -46,9 +46,18 @@ ln -s "$PWD/htmlview/htmlview" ~/.local/bin/htmlview
 | `+` `-` `0`           | zoom in / out / reset (also with `Ctrl`) |
 | `[` `]`               | back / forward                        |
 | `F12` `Ctrl-Shift-I`  | web inspector                         |
+| `j` `k`               | scroll down / up by 60px              |
+| `gg` `G`              | scroll to top / bottom                |
+| `/`                   | search (incremental, smartcase)       |
+| `n` `N`               | next / previous match                 |
+| `Esc`                 | clear search highlights               |
+
+In the search bar, `Enter` closes it but keeps highlights and the query (then
+`n` / `N` step through matches); `Esc` closes it and clears highlights. Search
+is case-insensitive unless the query contains an uppercase letter.
 
 Single-letter keys are suppressed while an `<input>`, `<textarea>`, or
-contenteditable element has focus, so typing `q` into a form field does not
+contenteditable element or the search bar has focus, so typing `q` into a form field does not
 close the window. Modifier bindings always work.
 
 ## Behaviour
@@ -78,10 +87,11 @@ close the window. Modifier bindings always work.
 ## Tests
 
 ```
+python3 test_keys.py      # key bindings, no display needed
 python3 test_htmlview.py
 ```
 
-Each test launches a real window for a few seconds, interrupts it, and checks
+Each `test_htmlview.py` test launches a real window for a few seconds, interrupts it, and checks
 the console output emitted by `examples/hello.html`. A running Wayland or X
 session is required; no extra test dependencies.
 
