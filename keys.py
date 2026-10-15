@@ -18,6 +18,10 @@ CTRL_ACTIONS = {
 }
 ALWAYS_ACTIONS = {"F5": "reload", "F12": "inspector"}
 
+# Ctrl-modified navigation, suppressed while typing (Ctrl-Up/Down move by
+# paragraph in text fields).
+CTRL_NAV_ACTIONS = {"Down": "section_next", "Up": "section_prev"}
+
 # Plain single-letter bindings, suppressed while typing.
 PLAIN_ACTIONS = {
     "q": "quit",
@@ -56,6 +60,10 @@ class KeyDispatcher:
         if ctrl:
             if shift and key in ("I", "i"):
                 return "inspector"
+            if key in CTRL_NAV_ACTIONS:
+                if editable_focus or search_focused:
+                    return None
+                return CTRL_NAV_ACTIONS[key]
             return CTRL_ACTIONS.get(key)
         if key in ALWAYS_ACTIONS:
             return ALWAYS_ACTIONS[key]

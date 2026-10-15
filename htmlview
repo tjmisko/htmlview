@@ -6,6 +6,7 @@ usage: htmlview [-w] [--dark | --light] <file.html | url | ->
 Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
        j k scroll   PgUp PgDn half page   gg top   G bottom
+       Ctrl-Up / Ctrl-Down previous / next section
        / search (Enter keeps highlights, Esc clears)   n N next / previous
        Esc clears highlights
 Page console output (console.log, uncaught errors) is echoed to stderr; when
@@ -82,6 +83,31 @@ FOCUS_PROBE = """
   document.addEventListener('focusin', post, true);
   document.addEventListener('focusout', () => setTimeout(post, 0), true);
   post();
+})();
+"""
+
+# Ctrl-Up/Down: jump to the previous/next section. Sections are the targets of
+# the page's table of contents (in-page links inside <nav>) when it has one,
+# else its h1-h3 headings. DIRECTION is replaced with 1 or -1.
+SECTION_JUMP = """
+(() => {
+  const SLACK = 8;
+  const fromToc = [...document.querySelectorAll('nav a[href^="#"]')]
+    .map((a) => document.getElementById(decodeURIComponent(a.hash.slice(1))))
+    .filter(Boolean);
+  const targets = fromToc.length ? fromToc : [...document.querySelectorAll('h1, h2, h3')];
+  const tops = [...new Set(targets
+    .filter((el) => el.getClientRects().length)
+    .map((el) => {
+      const margin = parseFloat(getComputedStyle(el).scrollMarginTop) || 0;
+      return Math.round(el.getBoundingClientRect().top + window.scrollY - margin);
+    }))].sort((a, b) => a - b);
+  const y = window.scrollY;
+  const target = DIRECTION > 0
+    ? tops.find((top) => top > y + SLACK)
+    : tops.reverse().find((top) => top < y - SLACK);
+  const top = target !== undefined ? target : DIRECTION < 0 ? 0 : y;
+  window.scrollTo({ top, behavior: 'instant' });
 })();
 """
 
@@ -243,12 +269,19 @@ class Viewer:
 
     def scroll_by(self, dy):
         self.view.evaluate_javascript(
-            f"window.scrollBy(0, {dy})", -1, None, None, None, None, None)
+            # instant: a page's smooth scroll-behavior makes held keys lag.
+            f"window.scrollBy({{top: {dy}, behavior: 'instant'}})",
+            -1, None, None, None, None, None)
 
     def scroll_to(self, bottom):
         target = "document.scrollingElement.scrollHeight" if bottom else "0"
         self.view.evaluate_javascript(
-            f"window.scrollTo(0, {target})", -1, None, None, None, None, None)
+            f"window.scrollTo({{top: {target}, behavior: 'instant'}})",
+            -1, None, None, None, None, None)
+
+    def jump_section(self, direction):
+        script = SECTION_JUMP.replace("DIRECTION", str(direction))
+        self.view.evaluate_javascript(script, -1, None, None, None, None, None)
 
     def on_key(self, _ctrl, keyval, _keycode, state):
         action = self.dispatcher.dispatch(
@@ -288,6 +321,10 @@ class Viewer:
             self.scroll_by(SCROLL_STEP_PX)
         elif action == "scroll_up":
             self.scroll_by(-SCROLL_STEP_PX)
+        elif action == "section_next":
+            self.jump_section(1)
+        elif action == "section_prev":
+            self.jump_section(-1)
         elif action == "half_page_down":
             self.scroll_by("window.innerHeight / 2")
         elif action == "half_page_up":

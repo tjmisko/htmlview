@@ -25,6 +25,17 @@ class KeyDispatcherTests(unittest.TestCase):
         self.assertIsNone(press(self.d, "Page_Down", editable=True))
         self.assertIsNone(press(self.d, "Page_Up", search=True))
 
+    def test_should_jump_sections_when_ctrl_arrows_pressed(self):
+        self.assertEqual(press(self.d, "Down", ctrl=True), "section_next")
+        self.assertEqual(press(self.d, "Up", ctrl=True), "section_prev")
+
+    def test_should_leave_ctrl_arrows_alone_when_typing(self):
+        self.assertIsNone(press(self.d, "Down", ctrl=True, editable=True))
+        self.assertIsNone(press(self.d, "Up", ctrl=True, search=True))
+
+    def test_should_not_jump_sections_when_arrows_pressed_without_ctrl(self):
+        self.assertIsNone(press(self.d, "Down"))
+
     def test_should_go_to_bottom_when_G_pressed(self):
         self.assertEqual(press(self.d, "G", shift=True), "bottom")
 

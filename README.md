@@ -49,6 +49,7 @@ ln -s "$PWD/htmlview/htmlview" ~/.local/bin/htmlview
 | `j` `k`               | scroll down / up by 60px              |
 | `PgUp` `PgDn`         | scroll up / down by half a page       |
 | `gg` `G`              | scroll to top / bottom                |
+| `Ctrl-Up` `Ctrl-Down` | previous / next section (the page's table of contents, else `h1`–`h3`) |
 | `/`                   | search (incremental, smartcase)       |
 | `n` `N`               | next / previous match                 |
 | `Esc`                 | clear search highlights               |
