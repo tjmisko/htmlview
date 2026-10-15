@@ -18,7 +18,8 @@ htmlview --separate page.html # independent process (implied by -)
 ```
 
 The first window opens in about 0.4 s; later ones in about 0.15 s, since they
-join the running process.
+join the running process. See [PERFORMANCE.md](PERFORMANCE.md) for memory and
+timing measurements, including a comparison with browsers.
 
 ## Install
 
