@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """htmlview: minimal WebKitGTK viewer for local HTML/JS artifacts.
 
-usage: htmlview [-w] [--dark | --light] <file.html | url | ->
+usage: htmlview [-w] [--dark | --light] [--separate] <file.html | url | ->
+
+Windows share one process and one web engine: the first htmlview becomes the
+host, and later invocations hand their target to it and exit, so each extra
+window costs a few MiB instead of a whole engine. --separate (implied by -)
+opens an independent process instead.
 
 Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        + - 0 zoom   [ ] back / forward   F12 / Ctrl-Shift-I inspector
@@ -9,8 +14,8 @@ Keys:  q / Ctrl-W / Ctrl-Q quit   r / F5 reload (Ctrl-R bypasses cache)
        Ctrl-Up / Ctrl-Down previous / next section
        / search (Enter keeps highlights, Esc clears)   n N next / previous
        Esc clears highlights
-Page console output (console.log, uncaught errors) is echoed to stderr; when
-stderr is a pipe the web process buffers it until exit.
+Page console output (console.log, uncaught errors) is echoed to the host
+process's stderr; when stderr is a pipe the web process buffers it until exit.
 """
 import argparse
 import os
@@ -18,6 +23,7 @@ import signal
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from handoff import listen, resolve_target, send, serve_one, socket_name  # noqa: E402
 from keys import KeyDispatcher, smartcase_insensitive  # noqa: E402
 
 
@@ -34,10 +40,27 @@ def parse_args(argv):
                        help="force prefers-color-scheme: dark")
     theme.add_argument("--light", action="store_true",
                        help="force prefers-color-scheme: light")
+    ap.add_argument("--separate", action="store_true",
+                    help="open in an independent process instead of the shared one")
     return ap.parse_args(argv)
 
 
 ARGS = parse_args(sys.argv[1:])
+SCHEME = "dark" if ARGS.dark else "light" if ARGS.light else "auto"
+SEPARATE = ARGS.separate or ARGS.target == "-"
+
+# Hand the target to a running host before paying for GTK. No host (or one
+# that went away mid-request) means this process becomes the host.
+if not SEPARATE:
+    _target, _error = resolve_target(ARGS.target, os.getcwd())
+    if _error:
+        sys.exit(f"htmlview: {_error}")
+    _reply = send(socket_name(SCHEME), {"target": _target, "watch": ARGS.watch})
+    if _reply == "ok":
+        sys.exit(0)
+    if _reply is not None:
+        sys.exit(f"htmlview: {_reply.removeprefix('error: ')}")
+    ARGS.target = _target
 
 # Older WebKit derives prefers-color-scheme from GtkSettings' prefer-dark
 # property, and GTK keeps re-syncing that property from the system color
@@ -61,8 +84,10 @@ try:  # PyGObject >= 3.50 moved the unix signal API to its own namespace
     gi.require_version("GLibUnix", "2.0")
     from gi.repository import GLibUnix
     unix_signal_add = GLibUnix.signal_add
+    unix_fd_add = GLibUnix.fd_add_full
 except (ValueError, ImportError):
     unix_signal_add = GLib.unix_signal_add
+    unix_fd_add = GLib.unix_fd_add_full
 
 ZOOM_STEP = 1.1
 SCROLL_STEP_PX = 60
@@ -124,6 +149,20 @@ def system_prefers_dark():
     )
 
 
+def target_error(target):
+    """Error string for a local file that does not exist, else None."""
+    if target == "-":
+        return None
+    gfile = Gio.File.new_for_commandline_arg(target)
+    if gfile.get_uri_scheme() == "file" and not gfile.query_exists(None):
+        return f"no such file: {target}"
+    return None
+
+
+# Open viewers, so a new window's WebView can join an existing web process.
+VIEWERS = []
+
+
 class Viewer:
     def __init__(self, app, args):
         self.app = app
@@ -158,7 +197,13 @@ class Viewer:
         # ~/.cache/htmlview, so localStorage persists across runs. (An ephemeral
         # session would be tidier, but its web process exits without flushing
         # the console echo enabled below.)
-        self.view = WebKit.WebView(user_content_manager=ucm)
+        #
+        # A related view shares its web process, so windows after the first
+        # cost a few MiB instead of a whole engine.
+        view_props = {"user_content_manager": ucm}
+        if VIEWERS:
+            view_props["related_view"] = VIEWERS[0].view
+        self.view = WebKit.WebView(**view_props)
         settings = self.view.get_settings()
         settings.set_enable_developer_extras(True)
         settings.set_enable_write_console_messages_to_stdout(True)  # lands on stderr
@@ -192,6 +237,8 @@ class Viewer:
         keys.connect("key-pressed", self.on_key)
         self.win.add_controller(keys)
 
+        VIEWERS.append(self)
+        self.win.connect("destroy", lambda _w: VIEWERS.remove(self))
         self.load(args.target)
         self.win.present()
 
@@ -205,8 +252,6 @@ class Viewer:
 
         gfile = Gio.File.new_for_commandline_arg(target)
         if gfile.get_uri_scheme() == "file":
-            if not gfile.query_exists(None):
-                sys.exit(f"htmlview: no such file: {target}")
             self.local_file = gfile
             self.win.set_title(gfile.get_basename())
             if self.args.watch:
@@ -417,12 +462,49 @@ class Viewer:
 
 def main():
     GLib.set_prgname("htmlview")  # Wayland app_id for window rules
-    # NON_UNIQUE: every invocation is its own process and window; without it a
-    # second `htmlview b.html` would just raise the first window and exit.
+    # NON_UNIQUE: GApplication's own uniqueness would replace the app_id with
+    # a dotted application id; the handoff socket does the sharing instead.
     app = Gtk.Application(flags=Gio.ApplicationFlags.NON_UNIQUE)
-    app.connect("activate", lambda a: Viewer(a, ARGS))
+
+    def activate(app):
+        error = target_error(ARGS.target)
+        if error:
+            sys.exit(f"htmlview: {error}")
+        Viewer(app, ARGS)
+        if not SEPARATE:
+            host(app)
+
+    app.connect("activate", activate)
     install_quit_signals(app)
     return app.run([])
+
+
+def host(app):
+    """Listen for later invocations and open their targets in new windows."""
+    sock = listen(socket_name(SCHEME))
+    if sock is None:  # another host won a startup race; stay standalone
+        return
+
+    def open_target(request):
+        args = argparse.Namespace(**{**vars(ARGS),
+                                     "target": request["target"],
+                                     "watch": bool(request.get("watch"))})
+        error = target_error(args.target)
+        if error:
+            return error
+        Viewer(app, args)
+        return None
+
+    def on_connection(_fd, _condition):
+        try:
+            conn, _ = sock.accept()
+        except OSError:
+            return GLib.SOURCE_CONTINUE
+        serve_one(conn, open_target)
+        return GLib.SOURCE_CONTINUE
+
+    app.host_socket = sock  # keep it alive for the app's lifetime
+    unix_fd_add(GLib.PRIORITY_DEFAULT, sock.fileno(), GLib.IOCondition.IN, on_connection)
 
 
 def install_quit_signals(app):

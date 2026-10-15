@@ -11,11 +11,46 @@ import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 
 HERE = pathlib.Path(__file__).resolve().parent
 HTMLVIEW = HERE / "htmlview"
 FIXTURE = HERE / "examples" / "hello.html"
 SETTLE_SECONDS = 3.0
+HANDOFF_MAX_SECONDS = 2.0
+
+# A private handoff socket per test run, so tests never hand pages to (or
+# receive them from) an htmlview the user has open.
+os.environ["HTMLVIEW_INSTANCE"] = f"test-{uuid.uuid4().hex[:8]}"
+
+
+def web_processes(pid):
+    """WebKit web content processes descended from pid."""
+    children = {}
+    for proc in pathlib.Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            ppid = int((proc / "stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            continue
+        children.setdefault(ppid, []).append(proc)
+    found, stack = [], [pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            stack.append(int(child.name))
+            try:
+                if (child / "comm").read_text().strip().startswith("WebKitWebProces"):
+                    found.append(int(child.name))
+            except OSError:
+                pass
+    return found
+
+
+def write_page(directory, marker):
+    page = pathlib.Path(directory) / f"{marker}.html"
+    page.write_text(f"<title>{marker}</title><script>console.log('{marker}')</script>")
+    return page
 
 
 def run_htmlview(*args, stdin=None, seconds=SETTLE_SECONDS, before_quit=None):
@@ -95,6 +130,48 @@ class HtmlviewTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("no such file", proc.stderr)
         self.assertLess(time.monotonic() - start, 5)
+
+    def test_should_open_second_target_in_running_host_when_one_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = write_page(tmp, "SHARED_FIRST"), write_page(tmp, "SHARED_SECOND")
+            host = subprocess.Popen([str(HTMLVIEW), str(first)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            time.sleep(SETTLE_SECONDS)
+            start = time.monotonic()
+            client = subprocess.run([str(HTMLVIEW), str(second)],
+                                    capture_output=True, text=True, timeout=10)
+            handoff_seconds = time.monotonic() - start
+            time.sleep(SETTLE_SECONDS)
+            web = web_processes(host.pid)
+            host.send_signal(signal.SIGINT)
+            _, err = host.communicate(timeout=10)
+
+        self.assertEqual(client.returncode, 0, client.stderr)
+        self.assertLess(handoff_seconds, HANDOFF_MAX_SECONDS)
+        self.assertIn("SHARED_FIRST", err)
+        self.assertIn("SHARED_SECOND", err)  # rendered by the host, not the client
+        self.assertEqual(len(web), 1, "both windows should share one web process")
+
+    def assert_stays_independent(self, *extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = write_page(tmp, "HOST"), write_page(tmp, "OTHER")
+            host = subprocess.Popen([str(HTMLVIEW), str(first)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(SETTLE_SECONDS)
+            other = subprocess.Popen([str(HTMLVIEW), *extra, str(second)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(HANDOFF_MAX_SECONDS + 1)
+            still_running = other.poll() is None
+            for proc in (other, host):
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=10)
+        self.assertTrue(still_running, "expected its own process, not a handoff")
+
+    def test_should_start_own_process_when_separate_flag_given(self):
+        self.assert_stays_independent("--separate")
+
+    def test_should_start_own_host_when_color_scheme_differs(self):
+        self.assert_stays_independent("--dark")
 
     def test_should_print_usage_when_no_target_given(self):
         proc = subprocess.run([str(HTMLVIEW)], capture_output=True, text=True, timeout=10)

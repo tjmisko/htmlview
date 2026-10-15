@@ -2,8 +2,9 @@
 
 A bare WebKitGTK window for viewing local HTML/JS files without a browser.
 
-No tabs, no URL bar, no browser profile, no extensions: one Python script (plus a small key-map module) on top
-of libraries your distribution already ships. Built for rendering generated
+No tabs, no URL bar, no browser profile, no extensions: one Python script
+(plus small key-map and handoff modules) on top of libraries your distribution
+already ships. Built for rendering generated
 HTML artifacts (e.g. from Claude Code) that use `fetch()` and ES modules,
 which browsers refuse to run from `file://`.
 
@@ -13,9 +14,11 @@ htmlview -w page.html         # reload whenever the file changes
 htmlview --light page.html    # force a color scheme (--dark / --light)
 htmlview https://example.com  # any URL
 cat page.html | htmlview -    # read HTML from stdin
+htmlview --separate page.html # independent process (implied by -)
 ```
 
-Starts in about a quarter of a second.
+The first window opens in about 0.4 s; later ones in about 0.15 s, since they
+join the running process.
 
 ## Install
 
@@ -78,10 +81,16 @@ close the window. Modifier bindings always work.
 - **Console output.** `console.log` and uncaught errors are echoed to stderr.
   The web process buffers this when stderr is a pipe, so redirected output
   arrives on exit.
-- **One window per invocation.** Running `htmlview` twice gives you two
-  independent windows. The Wayland `app_id` / X11 class is `htmlview`, for
-  compositor window rules.
-- **Site data** (`localStorage`, cache) is kept under
+- **One window per invocation, one engine for all of them.** The first
+  `htmlview` becomes the host; later invocations hand their target to it over
+  a Unix socket and exit, and it opens a new window that shares its WebKit web
+  and network processes. The first window costs about 110 MiB of private
+  memory; each further window about 10 MiB. The host exits when its last
+  window closes. Windows forced to `--dark` or `--light` get a host of their
+  own (the color scheme is process-wide), and `--separate` opens a fully
+  independent process, whose page console output stays on its own stderr.
+  One page crashing the web process takes the windows sharing it down too.
+  The Wayland `app_id` / X11 class is `htmlview`, for compositor window rules.- **Site data** (`localStorage`, cache) is kept under
   `~/.local/share/htmlview/` and `~/.cache/htmlview/`, so a page's remembered
   state survives between runs. Delete those directories to reset.
 - **Ctrl-C** in the terminal quits cleanly.
@@ -90,6 +99,7 @@ close the window. Modifier bindings always work.
 
 ```
 python3 test_keys.py      # key bindings, no display needed
+python3 test_handoff.py   # single-instance handoff, no display needed
 python3 test_htmlview.py
 ```
 
