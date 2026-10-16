@@ -1,5 +1,8 @@
 # htmlview
 
+> **Archived.** htmlview has been folded into
+> [limpid](https://github.com/tjmisko/limpid), which reads agent turns and markdown.
+
 A bare WebKitGTK window for viewing local HTML/JS files without a browser.
 
 No tabs, no URL bar, no browser profile, no extensions: one Python script
